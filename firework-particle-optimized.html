@@ -1,0 +1,550 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>除夕炫彩</title>
+<style>
+html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #000;
+}
+canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+}
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<script>
+(function() {
+    'use strict';
+    
+    // 性能优化：预计算和缓存
+    const pi = Math.PI;
+    const twoPi = pi * 2;
+    const audioPath = "https://cantelope.org/NYE/";
+    
+    // Canvas 优化
+    let canvas, ctx;
+    let cx, cy;
+    let scale = 600;
+    
+    // 游戏状态
+    let playerZ = -25;
+    let playerX = 0, playerY = 0;
+    let playerVX = 0, playerVY = 0, playerVZ = 0;
+    let pitch = 0, yaw = 0;
+    let pitchV = 0, yawV = 0;
+    
+    // 粒子系统
+    let seeds = [];
+    let sparks = [];
+    let sparkPics = [];
+    let seedTimer = 0;
+    const seedInterval = 5;
+    const seedLife = 100;
+    const gravity = 0.02;
+    
+    // 性能优化：限制粒子数量
+    const MAX_SPARKS = 800;
+    const MAX_SEEDS = 30;
+    
+    // 音频
+    let audioContext;
+    let audioBuffers = {};
+    let audioEnabled = false;
+    
+    // 帧率控制
+    let lastTime = 0;
+    const FPS = 60;
+    const frameInterval = 1000 / FPS;
+    
+    // 性能监控
+    let frames = 0;
+    let frameCount = 0;
+    let lastFpsTime = 0;
+    let currentFps = 0;
+    
+    // 初始化
+    function init() {
+        canvas = document.getElementById('canvas');
+        ctx = canvas.getContext('2d', { alpha: false }); // 关闭alpha提升性能
+        
+        // 设置canvas尺寸
+        resizeCanvas();
+        window.addEventListener('resize', resizeCanvas, false);
+        
+        // 预加载火花图片
+        loadSparkImages();
+        
+        // 初始化音频
+        initAudio();
+        
+        // 开始动画
+        requestAnimationFrame(animate);
+        
+        // 添加性能监控（开发时使用）
+        // setupPerformanceMonitor();
+    }
+    
+    function resizeCanvas() {
+        const width = window.innerWidth;
+        const height = window.innerHeight;
+        
+        // 使用devicePixelRatio优化高清显示
+        const dpr = window.devicePixelRatio || 1;
+        
+        // 设置显示尺寸
+        canvas.style.width = width + 'px';
+        canvas.style.height = height + 'px';
+        
+        // 设置实际渲染尺寸
+        canvas.width = width * dpr;
+        canvas.height = height * dpr;
+        
+        // 缩放上下文
+        ctx.scale(dpr, dpr);
+        
+        cx = width / 2;
+        cy = height / 2;
+    }
+    
+    function loadSparkImages() {
+        // 创建离屏canvas用于火花效果
+        const offscreenCanvas = document.createElement('canvas');
+        offscreenCanvas.width = 64;
+        offscreenCanvas.height = 64;
+        const offscreenCtx = offscreenCanvas.getContext('2d');
+        
+        // 预生成火花颜色
+        const colors = [
+            '#ff8844', '#8844ff', '#88ffff', '#ffffff',
+            '#44ff88', '#ff4444', '#ff8844', '#8844ff',
+            '#ffffff', '#4444ff'
+        ];
+        
+        for (let i = 0; i < 10; i++) {
+            const img = document.createElement('canvas');
+            img.width = 64;
+            img.height = 64;
+            const imgCtx = img.getContext('2d');
+            
+            // 创建径向渐变
+            const gradient = imgCtx.createRadialGradient(32, 32, 0, 32, 32, 32);
+            gradient.addColorStop(0, colors[i]);
+            gradient.addColorStop(0.5, colors[i] + 'aa');
+            gradient.addColorStop(1, colors[i] + '00');
+            
+            imgCtx.fillStyle = gradient;
+            imgCtx.fillRect(0, 0, 64, 64);
+            
+            sparkPics.push(img);
+        }
+    }
+    
+    function initAudio() {
+        try {
+            // 检查是否支持Web Audio API
+            if (window.AudioContext || window.webkitAudioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                audioEnabled = true;
+                
+                // 预加载音效
+                // 注意：由于跨域限制，这里仅作示例
+                // 实际使用中需要正确配置CORS或使用base64音频
+            }
+        } catch (e) {
+            console.log('音频初始化失败:', e);
+            audioEnabled = false;
+        }
+    }
+    
+    // 优化的3D点投影函数
+    function rasterizePoint(x, y, z) {
+        // 转换为相机空间
+        x -= playerX;
+        y -= playerY;
+        z -= playerZ;
+        
+        // 偏航旋转
+        const p = Math.atan2(x, z);
+        const d = Math.sqrt(x * x + z * z);
+        x = Math.sin(p - yaw) * d;
+        z = Math.cos(p - yaw) * d;
+        
+        // 俯仰旋转
+        const p2 = Math.atan2(y, z);
+        const d2 = Math.sqrt(y * y + z * z);
+        y = Math.sin(p2 - pitch) * d2;
+        z = Math.cos(p2 - pitch) * d2;
+        
+        // 检查是否在视野内
+        if (z <= 0.1) {
+            return { x: 0, y: 0, d: -1 };
+        }
+        
+        // 透视投影
+        const scaleFactor = scale / z;
+        return {
+            x: cx + x * scaleFactor,
+            y: cy + y * scaleFactor,
+            d: Math.sqrt(x * x + y * y + z * z)
+        };
+    }
+    
+    function spawnSeed() {
+        if (seeds.length >= MAX_SEEDS) return;
+        
+        const seed = {
+            x: -50 + Math.random() * 100,
+            y: 25,
+            z: -50 + Math.random() * 100,
+            vx: 0.1 - Math.random() * 0.2,
+            vy: -1.5,
+            vz: 0.1 - Math.random() * 0.2,
+            born: frames
+        };
+        seeds.push(seed);
+    }
+    
+    function splode(x, y, z) {
+        // 限制火花数量
+        if (sparks.length >= MAX_SPARKS) return;
+        
+        const t = 15 + Math.floor(Math.random() * 60); // 减少火花数量
+        const sparkV = 1 + Math.random() * 2.5;
+        const type = Math.floor(Math.random() * 3);
+        
+        // 预选图片
+        const pic1 = Math.floor(Math.random() * 10);
+        let pic2, pic3;
+        
+        if (type >= 1) {
+            do { pic2 = Math.floor(Math.random() * 10); } while (pic2 === pic1);
+        }
+        if (type === 2) {
+            do { pic3 = Math.floor(Math.random() * 10); } while (pic3 === pic1 || pic3 === pic2);
+        }
+        
+        // 批量创建火花
+        for (let m = 0; m < t; m++) {
+            if (sparks.length >= MAX_SPARKS) break;
+            
+            const spark = {
+                x, y, z,
+                vx: 0, vy: 0, vz: 0,
+                img: null,
+                radius: 25 + Math.random() * 50,
+                alpha: 1,
+                trail: [],
+                maxTrailLength: 3 // 减少轨迹长度
+            };
+            
+            // 随机方向
+            const p1 = twoPi * Math.random();
+            const p2 = pi * Math.random();
+            const v = sparkV * (0.8 + Math.random() * 0.4);
+            
+            spark.vx = Math.sin(p1) * Math.sin(p2) * v;
+            spark.vz = Math.cos(p1) * Math.sin(p2) * v;
+            spark.vy = Math.cos(p2) * v;
+            
+            // 选择图片
+            if (type === 0) {
+                spark.img = sparkPics[pic1];
+            } else if (type === 1) {
+                spark.img = Math.random() < 0.5 ? sparkPics[pic1] : sparkPics[pic2];
+            } else {
+                const r = Math.random();
+                if (r < 0.33) spark.img = sparkPics[pic1];
+                else if (r < 0.66) spark.img = sparkPics[pic2];
+                else spark.img = sparkPics[pic3];
+            }
+            
+            sparks.push(spark);
+        }
+        
+        // 播放音效（简化版）
+        if (audioEnabled) {
+            try {
+                // 这里简化处理，实际应用需要加载音频文件
+                // 使用简单的Web Audio API播放爆破声
+                playExplosionSound(x, y, z);
+            } catch (e) {
+                console.log('音效播放失败:', e);
+            }
+        }
+    }
+    
+    function playExplosionSound(x, y, z) {
+        if (!audioContext) return;
+        
+        // 计算距离
+        const dx = x - playerX;
+        const dy = y - playerY;
+        const dz = z - playerZ;
+        const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        const volume = Math.min(1.5 / (1 + distance / 10), 1);
+        
+        // 创建爆破音效
+        try {
+            const oscillator = audioContext.createOscillator();
+            const gainNode = audioContext.createGain();
+            
+            oscillator.connect(gainNode);
+            gainNode.connect(audioContext.destination);
+            
+            // 设置爆破音效
+            oscillator.frequency.setValueAtTime(100, audioContext.currentTime);
+            oscillator.frequency.exponentialRampToValueAtTime(20, audioContext.currentTime + 0.5);
+            
+            gainNode.gain.setValueAtTime(volume, audioContext.currentTime);
+            gainNode.gain.exponentialRampToValueAtTime(0.001, audioContext.currentTime + 0.5);
+            
+            oscillator.start();
+            oscillator.stop(audioContext.currentTime + 0.5);
+        } catch (e) {
+            console.log('音效创建失败:', e);
+        }
+    }
+    
+    // 优化的逻辑更新函数
+    function doLogic() {
+        // 控制种子生成频率
+        if (seedTimer <= frames && seeds.length < MAX_SEEDS) {
+            seedTimer = frames + seedInterval * (5 + Math.random() * 10);
+            spawnSeed();
+        }
+        
+        // 更新种子
+        for (let i = seeds.length - 1; i >= 0; i--) {
+            const seed = seeds[i];
+            seed.vy += gravity;
+            seed.x += seed.vx;
+            seed.y += seed.vy;
+            seed.z += seed.vz;
+            
+            if (frames - seed.born > seedLife) {
+                splode(seed.x, seed.y, seed.z);
+                seeds.splice(i, 1);
+            }
+        }
+        
+        // 更新火花（反向遍历以便安全删除）
+        for (let i = sparks.length - 1; i >= 0; i--) {
+            const spark = sparks[i];
+            
+            if (spark.alpha > 0 && spark.radius > 5) {
+                spark.alpha -= 0.01;
+                spark.radius /= 1.02;
+                spark.vy += gravity;
+                
+                // 更新轨迹
+                if (spark.trail.length === 0 || 
+                    Math.sqrt(
+                        Math.pow(spark.x - spark.trail[spark.trail.length - 1].x, 2) +
+                        Math.pow(spark.y - spark.trail[spark.trail.length - 1].y, 2) +
+                        Math.pow(spark.z - spark.trail[spark.trail.length - 1].z, 2)
+                    ) > 9) {
+                    spark.trail.push({ x: spark.x, y: spark.y, z: spark.z });
+                }
+                
+                if (spark.trail.length > spark.maxTrailLength) {
+                    spark.trail.shift();
+                }
+                
+                // 更新位置
+                spark.x += spark.vx;
+                spark.y += spark.vy;
+                spark.z += spark.vz;
+                
+                // 空气阻力
+                spark.vx *= 0.925;
+                spark.vy *= 0.925;
+                spark.vz *= 0.925;
+            } else {
+                sparks.splice(i, 1);
+            }
+        }
+        
+        // 摄像机移动（平滑圆周运动）
+        const p = Math.atan2(playerX, playerZ);
+        const d = Math.sqrt(playerX * playerX + playerZ * playerZ);
+        const t = Math.sin(frames / 200) / 40;
+        
+        playerX = Math.sin(p + t) * (d + Math.sin(frames / 80) / 1.25);
+        playerZ = Math.cos(p + t) * (d + Math.sin(frames / 80) / 1.25);
+        yaw = pi + p + t;
+        
+        frames++;
+    }
+    
+    // 优化的绘制函数
+    function draw() {
+        // 使用黑色清除画布
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        
+        // 绘制地面（简化版，减少数量）
+        ctx.fillStyle = '#ff8';
+        const groundStep = 8; // 增加步长减少点数
+        for (let i = -100; i < 100; i += groundStep) {
+            for (let j = -100; j < 100; j += groundStep) {
+                const point = rasterizePoint(i, 25, j);
+                if (point.d !== -1) {
+                    const size = 250 / (1 + point.d);
+                    const d = Math.sqrt(i * i + j * j);
+                    const a = 0.75 - Math.pow(d / 100, 6) * 0.75;
+                    
+                    if (a > 0) {
+                        ctx.globalAlpha = a;
+                        ctx.fillRect(point.x - size / 2, point.y - size / 2, size, size);
+                    }
+                }
+            }
+        }
+        
+        // 绘制种子
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = '#ffff88';
+        for (const seed of seeds) {
+            const point = rasterizePoint(seed.x, seed.y, seed.z);
+            if (point.d !== -1) {
+                const size = 200 / (1 + point.d);
+                ctx.fillRect(point.x - size / 2, point.y - size / 2, size, size);
+            }
+        }
+        
+        // 批量绘制火花和轨迹
+        const trailPoints = [];
+        
+        for (const spark of sparks) {
+            const point = rasterizePoint(spark.x, spark.y, spark.z);
+            if (point.d !== -1) {
+                const size = spark.radius * 200 / (1 + point.d);
+                
+                // 收集轨迹点
+                if (spark.trail.length > 0) {
+                    for (let j = 0; j < spark.trail.length - 1; j++) {
+                        const point1 = rasterizePoint(spark.trail[j].x, spark.trail[j].y, spark.trail[j].z);
+                        const point2 = rasterizePoint(spark.trail[j + 1].x, spark.trail[j + 1].y, spark.trail[j + 1].z);
+                        
+                        if (point1.d !== -1 && point2.d !== -1) {
+                            trailPoints.push({
+                                point1, point2,
+                                alpha: (j / spark.trail.length) * spark.alpha / 2,
+                                width: 1 + spark.radius * 10 / (spark.trail.length - j) / (1 + point2.d),
+                                color: getSparkColor(spark.img)
+                            });
+                        }
+                    }
+                }
+                
+                // 绘制火花
+                if (spark.alpha > 0 && spark.img) {
+                    ctx.globalAlpha = spark.alpha;
+                    ctx.drawImage(spark.img, point.x - size / 2, point.y - size / 2, size, size);
+                }
+            }
+        }
+        
+        // 批量绘制轨迹线
+        for (const trail of trailPoints) {
+            ctx.globalAlpha = trail.alpha;
+            ctx.strokeStyle = trail.color;
+            ctx.lineWidth = trail.width;
+            ctx.beginPath();
+            ctx.moveTo(trail.point1.x, trail.point1.y);
+            ctx.lineTo(trail.point2.x, trail.point2.y);
+            ctx.stroke();
+        }
+    }
+    
+    // 辅助函数：根据图片获取颜色
+    function getSparkColor(img) {
+        // 根据图片在数组中的位置返回颜色
+        const index = sparkPics.indexOf(img);
+        if (index === -1) return '#fff';
+        
+        switch(index % 10) {
+            case 0: return '#f84';
+            case 1: return '#84f';
+            case 2: return '#8ff';
+            case 3: return '#fff';
+            case 4: return '#4f8';
+            case 5: return '#f44';
+            case 6: return '#f84';
+            case 7: return '#84f';
+            case 8: return '#fff';
+            case 9: return '#44f';
+            default: return '#fff';
+        }
+    }
+    
+    // 主动画循环（带帧率控制）
+    function animate(currentTime) {
+        requestAnimationFrame(animate);
+        
+        // 帧率控制
+        if (!lastTime) lastTime = currentTime;
+        const deltaTime = currentTime - lastTime;
+        
+        if (deltaTime > frameInterval) {
+            lastTime = currentTime - (deltaTime % frameInterval);
+            
+            // 更新FPS计数
+            frameCount++;
+            if (currentTime - lastFpsTime >= 1000) {
+                currentFps = frameCount;
+                frameCount = 0;
+                lastFpsTime = currentTime;
+                
+                // 可选：显示FPS
+                // console.log('FPS:', currentFps);
+            }
+            
+            // 更新和绘制
+            doLogic();
+            draw();
+        }
+    }
+    
+    // 性能监控（可选）
+    function setupPerformanceMonitor() {
+        const fpsDisplay = document.createElement('div');
+        fpsDisplay.style.cssText = `
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            color: white;
+            background: rgba(0,0,0,0.5);
+            padding: 5px 10px;
+            font-family: monospace;
+            z-index: 10000;
+        `;
+        document.body.appendChild(fpsDisplay);
+        
+        setInterval(() => {
+            fpsDisplay.textContent = `FPS: ${currentFps} | Sparks: ${sparks.length} | Seeds: ${seeds.length}`;
+        }, 1000);
+    }
+    
+    // 页面加载完成后初始化
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+})();
+</script>
+</body>
+</html>
